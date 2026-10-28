@@ -3,6 +3,11 @@ name: Upstream release notifier
 # A fork never receives the parent repository's release webhooks or Actions
 # events, so this workflow polls the upstream release API instead of listening.
 #
+# The last notified tag is kept in the Actions cache rather than an issue or a
+# committed file, so no PAT and no repository features beyond Actions are
+# needed. If the cache entry is ever evicted, the next run re-notifies the
+# current release once.
+#
 # Secrets:
 #   FEISHU_WEBHOOK      (required) custom bot webhook URL
 #   FEISHU_SIGN_SECRET  (optional) bot signature secret; set it when the bot
@@ -22,7 +27,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: upstream-release-notifier
@@ -30,7 +34,7 @@ concurrency:
 
 env:
   UPSTREAM_REPO: router-for-me/CLIProxyAPI
-  STATE_ISSUE_TITLE: "upstream-release-watcher: last notified tag"
+  STATE_PATH: .upstream-release-state/tag
 
 jobs:
   notify:
@@ -50,22 +54,27 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Look up last notified tag
+      - name: Restore last notified tag
+        id: state_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .upstream-release-state
+          key: upstream-release-${{ github.run_id }}
+          restore-keys: |
+            upstream-release-
+
+      - name: Decide whether to notify
         id: state
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.release.outputs.tag }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          number="$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=all&per_page=100" \
-            | jq -r --arg title "$STATE_ISSUE_TITLE" '[.[] | select(.title == $title) | .number] | first // empty')"
           last=""
-          if [ -n "$number" ]; then
-            last="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${number}" \
-              | jq -r '.body | try fromjson | .lastTag // empty' || true)"
+          if [ -f "${STATE_PATH}" ]; then
+            last="$(tr -d '[:space:]' < "${STATE_PATH}")"
           fi
-          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "last=$last" >> "$GITHUB_OUTPUT"
           if [ "$FORCE" = "true" ] || { [ -n "$last" ] && [ "$last" != "$TAG" ]; }; then
             echo "should_notify=true" >> "$GITHUB_OUTPUT"
           else
@@ -74,6 +83,8 @@ jobs:
           # The very first run only records the current release, so importing the
           # workflow does not immediately notify about an already-published tag.
           if [ "$FORCE" = "true" ] || [ -z "$last" ] || [ "$last" != "$TAG" ]; then
+            mkdir -p "$(dirname "${STATE_PATH}")"
+            printf '%s\n' "$TAG" > "${STATE_PATH}"
             echo "store=true" >> "$GITHUB_OUTPUT"
           else
             echo "store=false" >> "$GITHUB_OUTPUT"
@@ -167,19 +178,9 @@ jobs:
           echo "$response"
           echo "$response" | jq -e '.code == 0 or .StatusCode == 0' > /dev/null
 
-      - name: Record last notified tag
+      - name: Save last notified tag
         if: steps.state.outputs.store == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.release.outputs.tag }}
-          NUMBER: ${{ steps.state.outputs.number }}
-        run: |
-          set -euo pipefail
-          body="$(jq -n --arg tag "$TAG" '{lastTag: $tag}')"
-          if [ -n "$NUMBER" ]; then
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}" -f body="$body" > /dev/null
-          else
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" \
-              -f title="$STATE_ISSUE_TITLE" \
-              -f body="$body" > /dev/null
-          fi
+        uses: actions/cache/save@v4
+        with:
+          path: .upstream-release-state
+          key: upstream-release-${{ github.run_id }}
