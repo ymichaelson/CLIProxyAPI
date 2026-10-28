@@ -24,6 +24,10 @@ on:
         description: Send a notification even if the tag was already reported
         type: boolean
         default: false
+      mention:
+        description: Optional open_id (ou_xxx) to @-mention in the card, for testing
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -97,12 +101,18 @@ jobs:
           # Optional: set this only when the bot has signature verification
           # enabled. When unset, the card is sent unsigned.
           FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          MENTION: ${{ inputs.mention }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           if [ -z "${FEISHU_WEBHOOK}" ]; then
             echo "::error::repository secret FEISHU_WEBHOOK is not set"
             exit 1
+          fi
+          # Manual runs may ask for an @-mention of another group member/bot.
+          mention_tag=""
+          if [ -n "${MENTION}" ]; then
+            mention_tag="<at id=${MENTION}></at>"
           fi
           # Feishu bot signature: sign = base64(HMAC-SHA256(key = timestamp + "\n" + secret, msg = "")).
           timestamp=""
@@ -141,6 +151,7 @@ jobs:
             --arg notes "$notes" \
             --arg timestamp "$timestamp" \
             --arg sign "$sign" \
+            --arg mention "$mention_tag" \
             '{
               msg_type: "interactive",
               card: {
@@ -154,7 +165,7 @@ jobs:
                     tag: "div",
                     text: {
                       tag: "lark_md",
-                      content: ("**版本**：[" + $title + "](" + $url + ")\n**发布时间**：" + $published + "\n\n" + $notes)
+                      content: ("**版本**：[" + $title + "](" + $url + ")\n**发布时间**：" + $published + "\n\n" + $notes + (if $mention == "" then "" else "\n\n" + $mention end))
                     }
                   },
                   {
