@@ -1,0 +1,185 @@
+name: Upstream release notifier
+
+# A fork never receives the parent repository's release webhooks or Actions
+# events, so this workflow polls the upstream release API instead of listening.
+#
+# Secrets:
+#   FEISHU_WEBHOOK      (required) custom bot webhook URL
+#   FEISHU_SIGN_SECRET  (optional) bot signature secret; set it when the bot
+#                       has "signature verification" enabled, otherwise the
+#                       card is sent unsigned and Feishu rejects it.
+on:
+  schedule:
+    # Every 6 hours at :17. Scheduled workflows run on the default branch only,
+    # and GitHub keeps them disabled in forks until Actions is enabled there.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Send a notification even if the tag was already reported
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-release-notifier
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: router-for-me/CLIProxyAPI
+  STATE_ISSUE_TITLE: "upstream-release-watcher: last notified tag"
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch latest upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${UPSTREAM_REPO}/releases/latest" > "${RUNNER_TEMP}/release.json"
+          tag="$(jq -r '.tag_name // empty' "${RUNNER_TEMP}/release.json")"
+          if [ -z "$tag" ]; then
+            echo "::error::upstream release payload has no tag_name"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Look up last notified tag
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          number="$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=all&per_page=100" \
+            | jq -r --arg title "$STATE_ISSUE_TITLE" '[.[] | select(.title == $title) | .number] | first // empty')"
+          last=""
+          if [ -n "$number" ]; then
+            last="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${number}" \
+              | jq -r '.body | try fromjson | .lastTag // empty' || true)"
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ] || { [ -n "$last" ] && [ "$last" != "$TAG" ]; }; then
+            echo "should_notify=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_notify=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The very first run only records the current release, so importing the
+          # workflow does not immediately notify about an already-published tag.
+          if [ "$FORCE" = "true" ] || [ -z "$last" ] || [ "$last" != "$TAG" ]; then
+            echo "store=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "store=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Feishu card
+        if: steps.state.outputs.should_notify == 'true'
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          # Optional: set this only when the bot has signature verification
+          # enabled. When unset, the card is sent unsigned.
+          FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FEISHU_WEBHOOK}" ]; then
+            echo "::error::repository secret FEISHU_WEBHOOK is not set"
+            exit 1
+          fi
+          # Feishu bot signature: sign = base64(HMAC-SHA256(key = timestamp + "\n" + secret, msg = "")).
+          timestamp=""
+          sign=""
+          if [ -n "${FEISHU_SIGN_SECRET}" ]; then
+            timestamp="$(date +%s)"
+            sign="$(python3 -c '
+          import base64, hashlib, hmac, sys
+          timestamp, secret = sys.argv[1], sys.argv[2]
+          string_to_sign = f"{timestamp}\n{secret}".encode()
+          print(base64.b64encode(hmac.new(string_to_sign, b"", hashlib.sha256).digest()).decode())
+          ' "$timestamp" "$FEISHU_SIGN_SECRET")"
+          fi
+          release="${RUNNER_TEMP}/release.json"
+          title="$(jq -r '.name // .tag_name' "$release")"
+          url="$(jq -r '.html_url // empty' "$release")"
+          published="$(jq -r '.published_at // .created_at // empty' "$release")"
+          if [ -n "$published" ]; then
+            published="$(date -u -d "$published" '+%Y-%m-%d %H:%M UTC')"
+          fi
+          # Drop HTML comments and Markdown heading markers: Feishu lark_md
+          # renders neither.
+          notes="$(jq -r '(.body // "")
+            | gsub("(?s)<!--.*?-->"; "")
+            | gsub("(?m)^#{1,6}\\s*"; "")
+            | sub("^\\s+"; "")
+            | .[0:2400]' "$release")"
+          if [ -z "$notes" ]; then
+            notes="（本次 release 没有更新说明）"
+          fi
+          jq -n \
+            --arg tag "$TAG" \
+            --arg title "$title" \
+            --arg url "$url" \
+            --arg published "$published" \
+            --arg notes "$notes" \
+            --arg timestamp "$timestamp" \
+            --arg sign "$sign" \
+            '{
+              msg_type: "interactive",
+              card: {
+                config: { wide_screen_mode: true },
+                header: {
+                  template: "blue",
+                  title: { tag: "plain_text", content: ("CLIProxyAPI " + $tag + " 已发布") }
+                },
+                elements: [
+                  {
+                    tag: "div",
+                    text: {
+                      tag: "lark_md",
+                      content: ("**版本**：[" + $title + "](" + $url + ")\n**发布时间**：" + $published + "\n\n" + $notes)
+                    }
+                  },
+                  {
+                    tag: "action",
+                    actions: [
+                      {
+                        tag: "button",
+                        text: { tag: "plain_text", content: "查看 Release" },
+                        type: "primary",
+                        url: $url
+                      }
+                    ]
+                  }
+                ]
+              }
+            } + (if $timestamp == "" then {} else { timestamp: $timestamp, sign: $sign } end)' > "${RUNNER_TEMP}/feishu.json"
+          response="$(curl -fsS -X POST \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data-binary "@${RUNNER_TEMP}/feishu.json" \
+            "$FEISHU_WEBHOOK")"
+          echo "$response"
+          echo "$response" | jq -e '.code == 0 or .StatusCode == 0' > /dev/null
+
+      - name: Record last notified tag
+        if: steps.state.outputs.store == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          NUMBER: ${{ steps.state.outputs.number }}
+        run: |
+          set -euo pipefail
+          body="$(jq -n --arg tag "$TAG" '{lastTag: $tag}')"
+          if [ -n "$NUMBER" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}" -f body="$body" > /dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" \
+              -f title="$STATE_ISSUE_TITLE" \
+              -f body="$body" > /dev/null
+          fi
