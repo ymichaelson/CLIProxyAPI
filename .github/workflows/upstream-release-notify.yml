@@ -135,11 +135,15 @@ jobs:
           fi
           # Drop HTML comments and Markdown heading markers: Feishu lark_md
           # renders neither.
+          # Truncate on a line boundary so the card never ends with a broken link.
           notes="$(jq -r '(.body // "")
             | gsub("(?s)<!--.*?-->"; "")
             | gsub("(?m)^#{1,6}\\s*"; "")
             | sub("^\\s+"; "")
-            | .[0:2400]' "$release")"
+            | if length > 2400 then
+                (.[0:2400] | split("\n") | .[:-1] | join("\n"))
+                + "\n…（内容已截断，请打开 Release 查看完整说明）"
+              else . end' "$release")"
           if [ -z "$notes" ]; then
             notes="（本次 release 没有更新说明）"
           fi
