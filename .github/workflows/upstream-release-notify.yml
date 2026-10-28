@@ -9,10 +9,12 @@ name: Upstream release notifier
 # current release once.
 #
 # Secrets:
-#   FEISHU_WEBHOOK      (required) custom bot webhook URL
-#   FEISHU_SIGN_SECRET  (optional) bot signature secret; set it when the bot
-#                       has "signature verification" enabled, otherwise the
-#                       card is sent unsigned and Feishu rejects it.
+#   FEISHU_WEBHOOK           (required) custom bot webhook URL
+#   FEISHU_SIGN_SECRET       (optional) bot signature secret; set it when the bot
+#                            has "signature verification" enabled, otherwise the
+#                            card is sent unsigned and Feishu rejects it.
+#   FEISHU_MENTION_OPEN_ID   (optional) an open_id that every card @-mentions;
+#                            the manual `mention` input overrides it.
 on:
   schedule:
     # Every 6 hours at :17. Scheduled workflows run on the default branch only,
@@ -25,7 +27,7 @@ on:
         type: boolean
         default: false
       mention:
-        description: Optional open_id (ou_xxx) to @-mention in the card, for testing
+        description: Optional open_id (ou_xxx) overriding FEISHU_MENTION_OPEN_ID for this run
         type: string
         default: ""
 
@@ -101,6 +103,7 @@ jobs:
           # Optional: set this only when the bot has signature verification
           # enabled. When unset, the card is sent unsigned.
           FEISHU_SIGN_SECRET: ${{ secrets.FEISHU_SIGN_SECRET }}
+          FEISHU_MENTION_OPEN_ID: ${{ secrets.FEISHU_MENTION_OPEN_ID }}
           MENTION: ${{ inputs.mention }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
@@ -109,10 +112,16 @@ jobs:
             echo "::error::repository secret FEISHU_WEBHOOK is not set"
             exit 1
           fi
-          # Manual runs may ask for an @-mention of another group member/bot.
+          # The secret mentions the same open_id on every card; a manual run can
+          # override it with the `mention` input.
+          mention_id="${MENTION:-${FEISHU_MENTION_OPEN_ID}}"
           mention_tag=""
-          if [ -n "${MENTION}" ]; then
-            mention_tag="<at id=${MENTION}></at>"
+          if [ -n "${mention_id}" ]; then
+            if [ "${mention_id#ou_}" = "${mention_id}" ]; then
+              echo "::error::mention open_id must start with ou_: ${mention_id}"
+              exit 1
+            fi
+            mention_tag="<at id=${mention_id}></at>"
           fi
           # Feishu bot signature: sign = base64(HMAC-SHA256(key = timestamp + "\n" + secret, msg = "")).
           timestamp=""
